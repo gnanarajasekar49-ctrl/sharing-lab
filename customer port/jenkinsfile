@@ -1,0 +1,94 @@
+pipeline {
+    agent any
+
+    options {
+        timestamps()
+        timeout(time: 20, unit: 'MINUTES')
+        disableConcurrentBuilds()
+    }
+
+    environment {
+        IMAGE_NAME     = 'customer-portal'
+        IMAGE_TAG      = "build-${env.BUILD_NUMBER}"          // e.g. customer-portal:build-25
+        CONTAINER_NAME = "portal-verify-${env.BUILD_NUMBER}"
+        GIT_REPO_URL   = 'https://github.com/YOUR_ORG/customer-portal.git'
+        GIT_BRANCH     = 'main'
+        GIT_CRED_ID    = 'git-credentials'                    // ID of the Jenkins credential (no secrets here)
+        NODE_IMAGE     = 'node:20-alpine'
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                checkout([
+                    $class: 'GitSCM',
+                    branches: [[name: "*/${env.GIT_BRANCH}"]],
+                    userRemoteConfigs: [[url: env.GIT_REPO_URL, credentialsId: env.GIT_CRED_ID]]
+                ])
+            }
+        }
+
+        stage('Build') {
+            steps {
+                script {
+                    docker.image(env.NODE_IMAGE).inside('-e npm_config_cache=/tmp/.npm') {
+                        sh 'npm ci'
+                        sh 'npm run build'
+                    }
+                }
+            }
+        }
+
+        stage('Test') {
+            steps {
+                script {
+                    docker.image(env.NODE_IMAGE).inside('-e npm_config_cache=/tmp/.npm') {
+                        sh 'npm test'
+                    }
+                }
+            }
+        }
+
+        // Only reached if Build and Test succeeded (a failing stage aborts the pipeline)
+        stage('Docker Build') {
+            steps {
+                sh "docker build -t ${IMAGE_NAME}:${IMAGE_TAG} --label build=${BUILD_NUMBER} ."
+            }
+        }
+
+        stage('Container Verification') {
+            steps {
+                sh '''
+                    docker run -d --name "$CONTAINER_NAME" "$IMAGE_NAME:$IMAGE_TAG"
+                    ok=0
+                    for i in $(seq 1 15); do
+                        if docker exec "$CONTAINER_NAME" wget -qO- http://127.0.0.1:3000/health | grep -q '"UP"'; then
+                            ok=1; break
+                        fi
+                        echo "Waiting for application... ($i)"; sleep 2
+                    done
+                    if [ "$ok" -ne 1 ]; then
+                        echo "Verification FAILED"; docker logs "$CONTAINER_NAME"; exit 1
+                    fi
+                    echo "Application is running: /health returned UP"
+                '''
+            }
+        }
+
+        stage('Cleanup') {
+            steps {
+                sh 'docker stop "$CONTAINER_NAME" && docker rm "$CONTAINER_NAME"'
+            }
+        }
+    }
+
+    post {
+        always {
+            // Safety net: remove the temp container even if verification failed
+            sh 'docker rm -f "$CONTAINER_NAME" || true'
+        }
+        success { echo "Built image ${IMAGE_NAME}:${IMAGE_TAG}" }
+        failure { echo 'Pipeline failed - no image was accepted for testing.' }
+    }
+}
